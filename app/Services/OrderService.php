@@ -6,9 +6,6 @@ use App\Jobs\OrderHandleJob;
 use App\Models\Order;
 use App\Models\Plan;
 use App\Models\User;
-use App\Models\Payment;
-use App\Utils\CacheKey;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class OrderService
@@ -33,6 +30,23 @@ class OrderService
     {
         $order = $this->order;
         $this->user = User::find($order->user_id);
+        if ($order->type == 9) {
+            DB::beginTransaction();
+            $this->user->balance += $order->total_amount + $this->getbounus($order->total_amount);
+
+            if (!$this->user->save()) {
+                DB::rollBack();
+                abort(500, '充值失败');
+            }
+            $order->status = 3;
+            if (!$order->save()) {
+                DB::rollBack();
+                abort(500, '充值失败');
+            }
+            DB::commit();
+            return;
+        }
+
         $plan = Plan::find($order->plan_id);
 
         if ($order->refund_amount) {
@@ -51,7 +65,7 @@ class OrderService
         }
         switch ((string)$order->period) {
             case 'onetime_price':
-                $this->buyByOneTime($plan);
+                $this->buyByOneTime($order, $plan);
                 break;
             case 'reset_price':
                 $this->buyByResetTraffic();
@@ -85,16 +99,15 @@ class OrderService
         }
 
         DB::commit();
-
-        // 发送订单完成邮件
-        $this->sendOrderCompleteEmail($order, $this->user, $plan);
     }
 
 
     public function setOrderType(User $user)
     {
         $order = $this->order;
-        if ($order->period === 'reset_price') {
+        if ($order->period === 'deposit'){
+            $order->type = 9;
+        } else if ($order->period === 'reset_price') {
             $order->type = 4;
         } else if ($user->plan_id !== NULL && $order->plan_id !== $user->plan_id && ($user->expired_at > time() || $user->expired_at === NULL)) {
             if (!(int)config('v2board.plan_change_enable', 1)) abort(500, '目前不允许更改订阅，请联系客服或提交工单操作');
@@ -177,54 +190,68 @@ class OrderService
             ->first();
         if (!$lastOneTimeOrder) return;
         $nowUserTraffic = $user->transfer_enable / 1073741824;
-        if (!$nowUserTraffic) return;
+        if ($nowUserTraffic == 0) return;
         $paidTotalAmount = ($lastOneTimeOrder->total_amount + $lastOneTimeOrder->balance_amount);
-        if (!$paidTotalAmount) return;
-        $trafficUnitPrice = $paidTotalAmount / $nowUserTraffic;
+        if ($paidTotalAmount == 0) return;
         $notUsedTraffic = $nowUserTraffic - (($user->u + $user->d) / 1073741824);
-        $result = $trafficUnitPrice * $notUsedTraffic;
+        $remainingTrafficRatio = $notUsedTraffic / $nowUserTraffic;
+        $result = $remainingTrafficRatio * $paidTotalAmount;
+        $order->surplus_amount = max($result, 0);
         $orderModel = Order::where('user_id', $user->id)->where('period', '!=', 'reset_price')->where('status', 3);
-        $order->surplus_amount = $result > 0 ? $result : 0;
         $order->surplus_order_ids = array_column($orderModel->get()->toArray(), 'id');
-    }
-
-    private function orderIsUsed(Order $order):bool
-    {
-        $month = self::STR_TO_TIME[$order->period];
-        $orderExpireDay = strtotime('+' . $month . ' month', $order->created_at);
-        if ($orderExpireDay < time()) return true;
-        return false;
     }
 
     private function getSurplusValueByPeriod(User $user, Order $order)
     {
-        $orderModel = Order::where('user_id', $user->id)
+        $orders = Order::where('user_id', $user->id)
             ->where('period', '!=', 'reset_price')
-            ->where('status', 3);
-        $orders = $orderModel->get();
-        $orderSurplusMonth = 0;
-        $orderSurplusAmount = 0;
-        $userSurplusMonth = ($user->expired_at - time()) / 2678400;
-        foreach ($orders as $k => $item) {
-            // 兼容历史余留问题
-            if ($item->period === 'onetime_price') continue;
-            if ($this->orderIsUsed($item)) continue;
-            $orderSurplusMonth = $orderSurplusMonth + self::STR_TO_TIME[$item->period];
-            $orderSurplusAmount = $orderSurplusAmount + ($item['total_amount'] + $item['balance_amount'] + $item['surplus_amount'] - $item['refund_amount']);
+            ->where('period', '!=', 'onetime_price')
+            ->where('period', '!=', 'deposit')
+            ->where('status', 3)
+            ->get()
+            ->toArray();
+        if (!$orders) return;
+        $orderAmountSum = 0;
+        $orderMonthSum = 0;
+        $lastValidateAt = null;
+        foreach ($orders as $item) {
+            $period = self::STR_TO_TIME[$item['period']];
+            $orderEndTime = strtotime("+{$period} month", $item['created_at']);
+            if ($orderEndTime < time()) continue;
+            $lastValidateAt = $item['created_at'] > $lastValidateAt ? $item['created_at'] : $lastValidateAt;
+            $orderMonthSum += $period;
+            $orderAmountSum += $item['total_amount'] + $item['balance_amount'] + $item['surplus_amount'] - $item['refund_amount'];
         }
-        if (!$orderSurplusMonth || !$orderSurplusAmount) return;
-        $monthUnitPrice = $orderSurplusAmount / $orderSurplusMonth;
-        // 如果用户过期月大于订单过期月
-        if ($userSurplusMonth > $orderSurplusMonth) {
-            $orderSurplusAmount = $orderSurplusMonth * $monthUnitPrice;
+        if ($lastValidateAt === null) return;
+    
+        $expiredAtByOrder = strtotime("+{$orderMonthSum} month", $lastValidateAt);
+        $expiredAtByUser = $user->expired_at;
+        if ($expiredAtByOrder < time() || $expiredAtByUser < time()) return;
+        $orderSurplusSecond = $expiredAtByUser - time();
+        $orderRangeSecond = $expiredAtByOrder - $lastValidateAt;
+    
+        $totalTraffic = $user->transfer_enable;
+        $usedTraffic = ($user->u + $user->d);
+        if ($totalTraffic == 0) return;
+    
+        $remainingTrafficRatio = ($totalTraffic - $usedTraffic) / $totalTraffic;
+    
+        $avgPricePerSecond = $orderAmountSum / $orderRangeSecond;
+        if ($orderRangeSecond <= 31 * 86400) {
+            $remainingExpiredTimeRatio = $orderSurplusSecond / $orderRangeSecond;
+            $surplusRatio = min($remainingExpiredTimeRatio, $remainingTrafficRatio);
+            $orderSurplusAmount = $avgPricePerSecond * $orderSurplusSecond * $surplusRatio;
         } else {
-            $orderSurplusAmount = $userSurplusMonth * $monthUnitPrice;
+            $monthSeconds = 30 * 86400;
+            $firstMonthRemainSeconds = $orderSurplusSecond % $monthSeconds;
+            $surplusRatio = min($firstMonthRemainSeconds / $monthSeconds, $remainingTrafficRatio);
+            $laterMonthsSeconds = $orderSurplusSecond - $firstMonthRemainSeconds;
+            $orderSurplusAmount = $avgPricePerSecond * $monthSeconds * $surplusRatio +
+                                  $avgPricePerSecond * $laterMonthsSeconds;
         }
-        if (!$orderSurplusAmount) {
-            return;
-        }
-        $order->surplus_amount = $orderSurplusAmount > 0 ? $orderSurplusAmount : 0;
-        $order->surplus_order_ids = array_column($orders->toArray(), 'id');
+    
+        $order->surplus_amount = max($orderSurplusAmount, 0);
+        $order->surplus_order_ids = array_column($orders, 'id');
     }
 
     public function paid(string $callbackNo)
@@ -235,7 +262,11 @@ class OrderService
         $order->paid_at = time();
         $order->callback_no = $callbackNo;
         if (!$order->save()) return false;
-        OrderHandleJob::dispatch($order->trade_no);
+        try {
+            OrderHandleJob::dispatch($order->trade_no);
+        } catch (\Exception $e) {
+            return false;
+        }
         return true;
     }
 
@@ -277,19 +308,38 @@ class OrderService
             $this->user->expired_at = time();
         }
         $this->user->transfer_enable = $plan->transfer_enable * 1073741824;
+        $this->user->device_limit = $plan->device_limit;
         // 从一次性转换到循环
         if ($this->user->expired_at === NULL) $this->buyByResetTraffic();
         // 新购
         if ($order->type === 1) $this->buyByResetTraffic();
+
+        // 到期当天续费刷新流量
+        $expireDay = date('d', $this->user->expired_at);
+        $expireMonth = date('m', $this->user->expired_at);
+        $today = date('d');
+        $currentMonth = date('m');
+        if ($order->type === 2 && $expireMonth == $currentMonth && $expireDay === $today ) {
+            $this->buyByResetTraffic();
+        }
+
         $this->user->plan_id = $plan->id;
         $this->user->group_id = $plan->group_id;
         $this->user->expired_at = $this->getTime($order->period, $this->user->expired_at);
     }
 
-    private function buyByOneTime(Plan $plan)
+    private function buyByOneTime(Order $order, Plan $plan)
     {
+        $transfer_enable = $plan->transfer_enable;
+        if (!$order->surplus_order_ids) {
+            $notUsedTraffic = ($this->user->transfer_enable - ($this->user->u + $this->user->d)) / 1073741824;
+            if ($notUsedTraffic > 0 && $this->user->expired_at == NULL) {
+                $transfer_enable += $notUsedTraffic;
+            }
+        }
         $this->buyByResetTraffic();
-        $this->user->transfer_enable = $plan->transfer_enable * 1073741824;
+        $this->user->transfer_enable = $transfer_enable * 1073741824;
+        $this->user->device_limit = $plan->device_limit;
         $this->user->plan_id = $plan->id;
         $this->user->group_id = $plan->group_id;
         $this->user->expired_at = NULL;
@@ -327,16 +377,22 @@ class OrderService
         }
     }
 
-    private function sendOrderCompleteEmail($order, $user, $plan)
-    {
-        // 获取支付方式信息
-        $payment = null;
-        if ($order->payment_id) {
-            $payment = Payment::find($order->payment_id);
+    private function getbounus($total_amount) {
+        $deposit_bounus = config('v2board.deposit_bounus', []);
+        if (empty($deposit_bounus) || $deposit_bounus[0] === null) {
+            return 0;
         }
-
-        // 发送邮件
-        $mailService = new MailService();
-        $mailService->orderComplete($order, $user, $plan, $payment);
+        $add = 0;
+        foreach ($deposit_bounus as $tier) {
+            list($amount, $bounus) = explode(':', $tier);
+            $amount = (float)$amount * 100;
+            $bounus = (float)$bounus * 100;
+            $amount = (int)$amount;
+            $bounus = (int)$bounus;
+            if ($total_amount >= $amount) {
+                $add = max($add, $bounus);
+            }
+        }
+        return $add;
     }
 }

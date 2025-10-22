@@ -37,7 +37,13 @@ class PaymentController extends Controller
         if (!$orderService->paid($callbackNo)) {
             return false;
         }
-        
+        $telegramService = new TelegramService();
+        $message = sprintf(
+            "💰成功收款%s元\n———————————————\n订单号：%s",
+            $order->total_amount / 100,
+            $order->trade_no
+        );
+        $telegramService->sendMessageWithAdmin($message);
         return true;
     }
 }
